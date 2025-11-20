@@ -276,8 +276,12 @@ model.to(device)
 print(f"Model with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters moved to {device}")
 
 # --- Optimizer and Loss Function ---
-optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-2)
+optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2, fused=True)
 criterion = nn.CrossEntropyLoss()
+scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
+
+num_epochs = 20
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
 # --- Early Stopping ---
 class EarlyStopping:
@@ -304,13 +308,20 @@ def train_epoch():
     total_loss = 0
     pbar = tqdm(train_loader, desc="Training", leave=False)
     for batch in pbar:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["label"].to(device)
-        optimizer.zero_grad()
-        logits = model(input_ids)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        
+        with torch.amp.autocast('cuda'):
+            logits = model(input_ids)
+            loss = criterion(logits, labels)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
         total_loss += loss.item()
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
     avg_loss = total_loss / len(train_loader)
@@ -355,7 +366,8 @@ for epoch in range(max_epochs):
     print(f"\nEpoch {epoch + 1}/{max_epochs}")
     train_loss = train_epoch()
     val_acc, _, _ = evaluate(val_loader)
-    print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f} | Validation Accuracy: {val_acc:.4f}")
+    scheduler.step()
+    print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f} | Validation Accuracy: {val_acc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
     
     # Print KAN layers every 2 epochs
     if (epoch + 1) % 2 == 0:

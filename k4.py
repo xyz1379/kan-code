@@ -159,8 +159,12 @@ model = model.to(device)
 print(f"Model moved to {device}")
 print(f"Total parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2, fused=True)
 criterion = nn.CrossEntropyLoss()
+scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
+
+num_epochs = 50
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
 # EarlyStopping class from your code
 class EarlyStopping:
@@ -197,13 +201,20 @@ def train_epoch():
     model.train()
     total_loss = 0
     for batch in train_loader:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["label"].to(device)
-        optimizer.zero_grad()
-        logits = model(input_ids)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        
+        with torch.amp.autocast('cuda'):
+            logits = model(input_ids)
+            loss = criterion(logits, labels)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
         total_loss += loss.item()
     avg_loss = total_loss / len(train_loader)
     print(f"Train loss: {avg_loss:.4f}")
@@ -254,6 +265,11 @@ for epoch in range(max_epochs):
     print(f"Epoch {epoch + 1}/{max_epochs}")
     train_loss = train_epoch()
     val_accuracy, _, _, _ = evaluate(val_loader, "Validation")
+    scheduler.step()
+    print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+    scheduler.step()
+    
+    print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
     
     # Record metrics for plotting
     train_loss_history.append(train_loss)
